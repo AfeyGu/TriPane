@@ -117,6 +117,8 @@ GetMonitorData(hwnd) {
     mon.second_set  := {}
     mon.first_order := []
     mon.second_order:= []
+    mon.other_set   := {}
+    mon.other_order := []
     monitors.Push(mon)
     return mon
 }
@@ -249,6 +251,11 @@ AssignWindow(hwnd, targetWhich) {
         fs.Delete(hwnd)
         RemoveFromList(fo, hwnd)
     }
+    ; 从其他组移除（如果当前在其他未分类池中）
+    if (ObjHasKey(mon.other_set, hwnd)) {
+        mon.other_set.Delete(hwnd)
+        RemoveFromList(mon.other_order, hwnd)
+    }
 
     if (targetWhich = "first") {
         fs[hwnd] := true
@@ -322,6 +329,135 @@ GetOtherWindowsForMonitor(mon) {
     return targets
 }
 
+; 同步当前屏幕的三个 order 数组：移除失效/已分类窗口，追加新未分类窗口
+SyncGroupOrder(mon) {
+    global monitors
+    ; first_order：移除不在 first_set 中或已关闭的窗口
+    i := 1
+    while (i <= mon.first_order.Length()) {
+        h := mon.first_order[i]
+        if (!WinExist("ahk_id " . h) || !ObjHasKey(mon.first_set, h)) {
+            mon.first_set.Delete(h)
+            mon.first_order.RemoveAt(i)
+        } else {
+            i++
+        }
+    }
+    ; second_order：同理
+    i := 1
+    while (i <= mon.second_order.Length()) {
+        h := mon.second_order[i]
+        if (!WinExist("ahk_id " . h) || !ObjHasKey(mon.second_set, h)) {
+            mon.second_set.Delete(h)
+            mon.second_order.RemoveAt(i)
+        } else {
+            i++
+        }
+    }
+    ; other_order：移除已归入 first/second、移出本屏或已关闭的窗口
+    i := 1
+    while (i <= mon.other_order.Length()) {
+        h := mon.other_order[i]
+        if (!WinExist("ahk_id " . h)) {
+            mon.other_set.Delete(h)
+            mon.other_order.RemoveAt(i)
+            continue
+        }
+        ; 检查是否已归入任意屏幕的分类（当前屏或其他屏）
+        isClassified := false
+        for mi, m in monitors {
+            if (ObjHasKey(m.first_set, h) || ObjHasKey(m.second_set, h)) {
+                isClassified := true
+                break
+            }
+        }
+        if (isClassified) {
+            mon.other_set.Delete(h)
+            mon.other_order.RemoveAt(i)
+            continue
+        }
+        wa := GetMonitorWorkArea(h)
+        if (wa.left != mon.wa.left || wa.top != mon.wa.top
+         || wa.right != mon.wa.right || wa.bottom != mon.wa.bottom) {
+            mon.other_set.Delete(h)
+            mon.other_order.RemoveAt(i)
+            continue
+        }
+        i++
+    }
+    ; 扫描当前显示器上所有未分类窗口，将新窗口追加到 other_order 末尾
+    WinGet, allIds, List
+    Loop, % allIds {
+        h := allIds%A_Index%
+        if (IsExcluded(h))
+            continue
+        wa := GetMonitorWorkArea(h)
+        if (wa.left != mon.wa.left || wa.top != mon.wa.top
+         || wa.right != mon.wa.right || wa.bottom != mon.wa.bottom)
+            continue
+        ; 跳过已归入任意屏幕分类的窗口
+        isClassified := false
+        for mi, m in monitors {
+            if (ObjHasKey(m.first_set, h) || ObjHasKey(m.second_set, h)) {
+                isClassified := true
+                break
+            }
+        }
+        if (isClassified)
+            continue
+        if (ObjHasKey(mon.other_set, h))
+            continue
+        mon.other_set[h] := true
+        mon.other_order.Push(h)
+    }
+}
+
+; ============================================================
+; 全局重扫描：清理所有窗口状态，自动归类贴半屏的窗口
+; ============================================================
+ReclassifyAllWindows() {
+    global monitors, window_original
+    ; 清理所有监视器分组中的失效句柄
+    for idx, mon in monitors {
+        CleanList(mon.first_order, mon.first_set)
+        CleanList(mon.second_order, mon.second_set)
+        CleanList(mon.other_order, mon.other_set)
+    }
+    ; 扫描所有窗口，自动归类贴半屏的未分类窗口
+    WinGet, allIds, List
+    Loop, % allIds {
+        h := allIds%A_Index%
+        if (IsExcluded(h))
+            continue
+        if (h = A_ScriptHwnd)
+            continue
+        ; 跳过已归入任意分组的窗口
+        already := false
+        for idx, mon in monitors {
+            if (ObjHasKey(mon.first_set, h) || ObjHasKey(mon.second_set, h)) {
+                already := true
+                break
+            }
+        }
+        if (already)
+            continue
+        ; 检测是否贴半屏
+        side := DetectHalfGroup(h)
+        if (side = "")
+            continue
+        ; 自动归入对应分组
+        SaveOriginalIfFirst(h)
+        mon := GetMonitorData(h)
+        if (side = "first") {
+            mon.first_set[h] := true
+            mon.first_order.Push(h)
+        } else {
+            mon.second_set[h] := true
+            mon.second_order.Push(h)
+        }
+    }
+}
+
 CycleNext(list, set := "") {
     if (list.Length() = 0)
         return
@@ -353,6 +489,47 @@ CycleNext(list, set := "") {
         }
         if (target != active || list.Length() = 1) {
             WinRestore, ahk_id %target%
+            DllCall("SetForegroundWindow", "ptr", target)
+            WinActivate, ahk_id %target%
+            return
+        }
+        startIdx := nextIdx
+        i++
+    }
+}
+
+; 只置顶不恢复窗口（用于 Alt+2 其他窗口循环）
+CycleOther(mon) {
+    global monitors
+    list := mon.other_order
+    if (list.Length() = 0)
+        return
+    active := WinExist("A")
+    startIdx := 0
+    for idx, h in list {
+        if (h = active) {
+            startIdx := idx
+            break
+        }
+    }
+    maxAttempts := list.Length()
+    i := 0
+    while (i < maxAttempts) {
+        nextIdx := (startIdx = 0) ? 1 : Mod(startIdx, list.Length()) + 1
+        if (list.Length() = 1 && list[1] = active)
+            return
+        target := list[nextIdx]
+        if (!WinExist("ahk_id " . target)) {
+            mon.other_set.Delete(target)
+            list.RemoveAt(nextIdx)
+            if (nextIdx <= startIdx && startIdx > 0)
+                startIdx--
+            if (list.Length() = 0)
+                return
+            i++
+            continue
+        }
+        if (target != active || list.Length() = 1) {
             DllCall("SetForegroundWindow", "ptr", target)
             WinActivate, ahk_id %target%
             return
@@ -399,10 +576,6 @@ ClassifyExistingWindows() {
         if (already)
             continue
 
-        WinGet, minMax, MinMax, ahk_id %h%
-        if (minMax = -1)
-            continue
-
         side := DetectHalfGroup(h)
         if (side = "")
             continue
@@ -410,13 +583,17 @@ ClassifyExistingWindows() {
         SaveOriginalIfFirst(h)
         mon := GetMonitorData(h)
         if (side = "first") {
-            mon.first_set[h] := true
-            mon.first_order.Push(h)
-            foundFirst++
+            if (!ObjHasKey(mon.first_set, h)) {
+                mon.first_set[h] := true
+                mon.first_order.Push(h)
+                foundFirst++
+            }
         } else {
-            mon.second_set[h] := true
-            mon.second_order.Push(h)
-            foundSecond++
+            if (!ObjHasKey(mon.second_set, h)) {
+                mon.second_set[h] := true
+                mon.second_order.Push(h)
+                foundSecond++
+            }
         }
     }
     if (foundFirst > 0 || foundSecond > 0)
@@ -430,6 +607,7 @@ CleanupWindows:
     for idx, mon in monitors {
         CleanList(mon.first_order, mon.first_set)
         CleanList(mon.second_order, mon.second_set)
+        CleanList(mon.other_order, mon.other_set)
     }
     toDelete := []
     for hwnd, val in window_original {
@@ -514,7 +692,9 @@ return
     hwnd := WinExist("A")
     if (IsExcluded(hwnd))
         return
+    ReclassifyAllWindows()
     mon := GetMonitorData(hwnd)
+    SyncGroupOrder(mon)
     CycleNext(mon.first_order, mon.first_set)
 return
 
@@ -523,11 +703,11 @@ return
     hwnd := WinExist("A")
     if (IsExcluded(hwnd))
         return
+    ReclassifyAllWindows()
     mon := GetMonitorData(hwnd)
-    ClassifyExistingWindows()
-    others := GetOtherWindowsForMonitor(mon)
-    ShowOSD("其他窗口共 " . others.Length() . " 个", hwnd)
-    CycleNext(others)
+    SyncGroupOrder(mon)
+    ShowOSD("其他窗口共 " . mon.other_order.Length() . " 个", hwnd)
+    CycleNext(mon.other_order, mon.other_set)
 return
 
 ; Alt+3 : cycle second group (横屏=右侧，竖屏=下方)
@@ -535,7 +715,9 @@ return
     hwnd := WinExist("A")
     if (IsExcluded(hwnd))
         return
+    ReclassifyAllWindows()
     mon := GetMonitorData(hwnd)
+    SyncGroupOrder(mon)
     CycleNext(mon.second_order, mon.second_set)
 return
 
