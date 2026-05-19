@@ -19,6 +19,7 @@ DllCall("SetThreadDpiAwarenessContext", "ptr", -4, "ptr")
 ; ============================================================
 monitors := []        ; 每屏一份 {wa, is_portrait, first_set, second_set, first_order, second_order}
 window_original := {} ; 窗口原始位置快照
+g_last_other_hwnd := 0 ; 上次 Alt+2 轮换到的窗口，用于跨组回退定位
 
 ; ============================================================
 ; Tray menu
@@ -287,6 +288,52 @@ UnassignWindow(hwnd) {
     return removed
 }
 
+; 检查窗口是否已分类窗口的浮动面板/工具窗口（通过 owner 关系检测）
+IsFloatingPanelOfClassified(h) {
+    global monitors
+    ; 获取 owner（拥有者窗口），GW_OWNER = 4
+    owner := DllCall("GetWindow", "ptr", h, "uint", 4)
+    if (!owner)
+        return false
+    ; 检查 owner 是否在任一分组的分类组中
+    for mi, m in monitors {
+        if (ObjHasKey(m.first_set, owner) || ObjHasKey(m.second_set, owner))
+            return true
+    }
+    return false
+}
+
+; ============================================================
+; 获取真实的"活动主窗口"：若当前焦点在工具窗口/子窗口上，
+; 则向上追溯 owner 链或父窗口链，找到可操作的主窗口
+; ============================================================
+GetTrueActiveWindow() {
+    hwnd := WinExist("A")
+    if (!IsExcluded(hwnd))
+        return hwnd
+    ; 尝试沿着 owner 链向上追溯（GW_OWNER = 4）
+    ; 工具窗口/浮动面板通常有 owner 指向主窗口
+    owner := hwnd
+    Loop, 10 {
+        owner := DllCall("GetWindow", "ptr", owner, "uint", 4)
+        if (!owner)
+            break
+        if (!IsExcluded(owner))
+            return owner
+    }
+    ; owner 链没找到 → 尝试父窗口链（GW_PARENT = 2）
+    parent := hwnd
+    Loop, 10 {
+        parent := DllCall("GetWindow", "ptr", parent, "uint", 2)
+        if (!parent)
+            break
+        if (!IsExcluded(parent))
+            return parent
+    }
+    ; 都找不到则返回原始 hwnd（保持原行为）
+    return hwnd
+}
+
 ; 收集所有未分类窗口
 GetOtherWindows() {
     global monitors
@@ -303,8 +350,12 @@ GetOtherWindows() {
                 break
             }
         }
-        if (!isAssigned)
-            targets.Push(h)
+        if (isAssigned)
+            continue
+        ; 浮动面板检测：窗口拥有者已在分类组中，则跳过
+        if (IsFloatingPanelOfClassified(h))
+            continue
+        targets.Push(h)
     }
     return targets
 }
@@ -323,6 +374,9 @@ GetOtherWindowsForMonitor(mon) {
          || wa.right != mon.wa.right || wa.bottom != mon.wa.bottom)
             continue
         if (ObjHasKey(mon.first_set, h) || ObjHasKey(mon.second_set, h))
+            continue
+        ; 浮动面板检测：窗口拥有者已在分类组中，则跳过
+        if (IsFloatingPanelOfClassified(h))
             continue
         targets.Push(h)
     }
@@ -405,6 +459,9 @@ SyncGroupOrder(mon) {
         }
         if (isClassified)
             continue
+        ; 浮动面板检测：窗口拥有者已在分类组中，则跳过
+        if (IsFloatingPanelOfClassified(h))
+            continue
         if (ObjHasKey(mon.other_set, h))
             continue
         mon.other_set[h] := true
@@ -458,10 +515,10 @@ ReclassifyAllWindows() {
     }
 }
 
-CycleNext(list, set := "") {
+CycleNext(list, set := "", active_hwnd := "") {
     if (list.Length() = 0)
         return
-    active := WinExist("A")
+    active := active_hwnd ? active_hwnd : WinExist("A")
     startIdx := 0
     for idx, h in list {
         if (h = active) {
@@ -498,18 +555,43 @@ CycleNext(list, set := "") {
     }
 }
 
-; 只置顶不恢复窗口（用于 Alt+2 其他窗口循环）
-CycleOther(mon) {
-    global monitors
+; 其他窗口轮换（带跨组回退 + 进程名匹配 + 记忆上次位置）
+CycleOtherFallback(mon, active_hwnd := "") {
+    global g_last_other_hwnd
     list := mon.other_order
     if (list.Length() = 0)
         return
-    active := WinExist("A")
+    active := active_hwnd ? active_hwnd : WinExist("A")
     startIdx := 0
+    ; 1) 先精确查找当前活动窗口在列表中的位置
     for idx, h in list {
         if (h = active) {
             startIdx := idx
             break
+        }
+    }
+    ; 2) 精确匹配失败 → 按进程名匹配（跨组：活动窗口已归入 first/second，但同进程有其他窗口在 other 中）
+    if (startIdx = 0) {
+        WinGet, activeProc, ProcessName, ahk_id %active%
+        if (activeProc != "") {
+            for idx, h in list {
+                if (h = active)
+                    continue
+                WinGet, hProc, ProcessName, ahk_id %h%
+                if (hProc = activeProc) {
+                    startIdx := idx
+                    break
+                }
+            }
+        }
+    }
+    ; 3) 进程名也无法匹配 → 使用记忆的上次轮换位置
+    if (startIdx = 0 && g_last_other_hwnd != 0) {
+        for idx, h in list {
+            if (h = g_last_other_hwnd) {
+                startIdx := idx
+                break
+            }
         }
     }
     maxAttempts := list.Length()
@@ -532,6 +614,7 @@ CycleOther(mon) {
         if (target != active || list.Length() = 1) {
             DllCall("SetForegroundWindow", "ptr", target)
             WinActivate, ahk_id %target%
+            g_last_other_hwnd := target  ; 记忆本次激活的窗口
             return
         }
         startIdx := nextIdx
@@ -624,9 +707,7 @@ return
 
 ; Alt+Q : assign to first group (横屏=左，竖屏=上)
 !q::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     mon := GetMonitorData(hwnd)
     lbl := GetGroupLabel(mon)
     if (AssignWindow(hwnd, "first"))
@@ -635,9 +716,7 @@ return
 
 ; Alt+E : assign to second group (横屏=右，竖屏=下)
 !e::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     mon := GetMonitorData(hwnd)
     lbl := GetGroupLabel(mon)
     if (AssignWindow(hwnd, "second"))
@@ -646,9 +725,7 @@ return
 
 ; Alt+W : restore to other (移出分组)
 !w::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     mon := GetMonitorData(hwnd)
     lbl := GetGroupLabel(mon)
     isFirst  := ObjHasKey(mon.first_set, hwnd)
@@ -689,43 +766,35 @@ return
 
 ; Alt+1 : cycle first group (横屏=左侧，竖屏=上方)
 !1::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     ReclassifyAllWindows()
     mon := GetMonitorData(hwnd)
     SyncGroupOrder(mon)
-    CycleNext(mon.first_order, mon.first_set)
+    CycleNext(mon.first_order, mon.first_set, hwnd)
 return
 
 ; Alt+2 : cycle unassigned (other) windows on current monitor (横屏=中间, 竖屏=中间)
 !2::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     ReclassifyAllWindows()
     mon := GetMonitorData(hwnd)
     SyncGroupOrder(mon)
     ShowOSD("其他窗口共 " . mon.other_order.Length() . " 个", hwnd)
-    CycleNext(mon.other_order, mon.other_set)
+    CycleOtherFallback(mon, hwnd)
 return
 
 ; Alt+3 : cycle second group (横屏=右侧，竖屏=下方)
 !3::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     ReclassifyAllWindows()
     mon := GetMonitorData(hwnd)
     SyncGroupOrder(mon)
-    CycleNext(mon.second_order, mon.second_set)
+    CycleNext(mon.second_order, mon.second_set, hwnd)
 return
 
 ; Alt+R : swap first and second groups on active monitor
 !r::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     mon := GetMonitorData(hwnd)
     lbl := GetGroupLabel(mon)
     for idx, h in mon.first_order {
@@ -747,9 +816,7 @@ return
 
 ; --- Alt+A : full screen (work area)，移出分组 ---
 !a::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     SaveOriginalIfFirst(hwnd)
     UnassignWindow(hwnd)
     ResizeToPercent(hwnd, 100)
@@ -758,9 +825,7 @@ return
 
 ; --- Alt+S : 80% screen size，移出分组 ---
 !s::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     SaveOriginalIfFirst(hwnd)
     UnassignWindow(hwnd)
     ResizeToPercent(hwnd, 80)
@@ -769,9 +834,7 @@ return
 
 ; --- Alt+D : 60% screen size，移出分组 ---
 !d::
-    hwnd := WinExist("A")
-    if (IsExcluded(hwnd))
-        return
+    hwnd := GetTrueActiveWindow()
     SaveOriginalIfFirst(hwnd)
     UnassignWindow(hwnd)
     ResizeToPercent(hwnd, 60)
